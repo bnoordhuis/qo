@@ -4,37 +4,49 @@ package main
 //#include "3p/quickjs.h"
 //#include <stdlib.h>
 //#include <string.h>
+//void hostPromiseRejectionTracker(JSContext *cx, JSValue promise, JSValue reason, JS_BOOL is_handled, void *opaque);
 //static JSValue throwTypeError(JSContext *cx, const char *message) { return JS_ThrowTypeError(cx, "%s", message); }
 //#define Q(name) static const JSValue JS##name(void) { return JS_##name; }
 //#define M(name) JSValue name(JSContext *cx, JSValue thisObj, int argc, JSValue *argv);
 //Q(EXCEPTION) Q(FALSE) Q(NULL) Q(TRUE) Q(UNDEFINED) Q(UNINITIALIZED)
-//M(atob) M(btoa) M(consoleLog) M(setTimeout) M(clearTimeout) M(get)
+//M(atob) M(btoa) M(consoleLog) M(setTimeout) M(clearTimeout)
+//M(get) M(read) M(close)
 import "C"
 
 import (
 	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 	"unsafe"
 )
 
+type JSRuntime = C.JSRuntime
 type JSContext = C.JSContext
 type JSValue = C.JSValue
 
 var ch chan func()
 var jobs int
-var timers map[int]chan bool = make(map[int]chan bool)
+var timers = make(map[int]chan bool)
 var timerids int
+var responses = make(map[int]*http.Response)
+var responseids int
 
 func main() {
+	runtime.LockOSThread() // pin goroutine to thread
+
 	flag.Parse()
 
 	ch = make(chan func(), 1)
 	rt := C.JS_NewRuntime()
 	defer C.JS_FreeRuntime(rt)
+	//C.JS_SetMaxStackSize(rt, 0)
+	C.JS_SetHostPromiseRejectionTracker(rt, (*C.JSHostPromiseRejectionTracker)(C.hostPromiseRejectionTracker), nil)
+
 	cx := C.JS_NewContext(rt)
 	defer C.JS_FreeContext(cx)
 
@@ -42,6 +54,8 @@ func main() {
 	defer C.JS_FreeValue(cx, global)
 
 	addMethod(cx, global, "get", 1, (*C.JSCFunction)(C.get))
+	addMethod(cx, global, "read", 1, (*C.JSCFunction)(C.read))
+	addMethod(cx, global, "close", 0, (*C.JSCFunction)(C.close))
 
 	addMethod(cx, global, "atob", 1, (*C.JSCFunction)(C.atob))
 	addMethod(cx, global, "btoa", 1, (*C.JSCFunction)(C.btoa))
@@ -58,26 +72,34 @@ func main() {
 			panic(err)
 		}
 		v := eval(cx, filename, string(b), C.JS_EVAL_TYPE_GLOBAL|C.JS_EVAL_FLAG_STRICT)
-		if isException(v) {
+		if v.isException() {
 			v := C.JS_GetException(cx)
-			defer C.JS_FreeValue(cx, v)
 			fmt.Println("exception:", toString(cx, v))
 			os.Exit(1)
 		}
+		defer C.JS_FreeValue(cx, v)
 	}
+
+	executePendingJobs(rt)
 
 	for jobs > 0 {
 		(<-ch)()
 		jobs--
-	}
-
-	for 0 != C.JS_IsJobPending(rt) {
-		var cx *JSContext
-		C.JS_ExecutePendingJob(rt, &cx)
+		executePendingJobs(rt)
 	}
 }
 
-func isException(v JSValue) bool {
+func executePendingJobs(rt *JSRuntime) {
+	var cx *JSContext
+	for 0 != C.JS_ExecutePendingJob(rt, &cx) {}
+}
+
+//export hostPromiseRejectionTracker
+func hostPromiseRejectionTracker(cx *JSContext, promise, reason JSValue, isHandled C.JS_BOOL, opaque *C.void) {
+	fmt.Println("rejected promise:", toString(cx, reason))
+}
+
+func (v JSValue) isException() bool {
 	return 0 != C.JS_IsException(v)
 }
 
@@ -121,23 +143,11 @@ func throwTypeError(cx *JSContext, message string) JSValue {
 	return C.throwTypeError(cx, message_)
 }
 
-func makeTypeError(cx *JSContext, message string) JSValue {
-	old := C.JS_GetException(cx)
-	throwTypeError(cx, message)
-	ex := C.JS_GetException(cx)
-	if 0 != C.JS_IsNull(old) {
-		C.JS_Throw(cx, old)
-	}
-	return ex
-}
-
 // note: takes ownership of |val|, don't call JS_FreeValue()
 func definePropertyValue(cx *JSContext, thisObj JSValue, name string, val JSValue, flags int) {
 	name_ := C.CString(name)
 	defer C.free(unsafe.Pointer(name_))
-	atom := C.JS_NewAtom(cx, name_)
-	defer C.JS_FreeAtom(cx, atom)
-	if 1 != C.JS_DefinePropertyValue(cx, thisObj, atom, val, C.int(flags)) {
+	if 1 != C.JS_DefinePropertyValueStr(cx, thisObj, name_, val, C.int(flags)) {
 		panic("JS_DefinePropertyValue")
 	}
 }
@@ -145,10 +155,8 @@ func definePropertyValue(cx *JSContext, thisObj JSValue, name string, val JSValu
 func addMethod(cx *JSContext, thisObj JSValue, name string, length int, f *C.JSCFunction) {
 	name_ := C.CString(name)
 	defer C.free(unsafe.Pointer(name_))
-	atom := C.JS_NewAtom(cx, name_)
-	defer C.JS_FreeAtom(cx, atom)
 	val := C.JS_NewCFunction2(cx, f, name_, C.int(length), C.JS_CFUNC_generic, 0)
-	if 1 != C.JS_DefinePropertyValue(cx, thisObj, atom, val, C.JS_PROP_CONFIGURABLE|C.JS_PROP_WRITABLE) {
+	if 1 != C.JS_DefinePropertyValueStr(cx, thisObj, name_, val, C.JS_PROP_CONFIGURABLE|C.JS_PROP_WRITABLE) {
 		panic("JS_DefinePropertyValue")
 	}
 }
@@ -291,25 +299,88 @@ func get(cx *JSContext, thisObj JSValue, argc C.int, argv *JSValue) JSValue {
 	}
 	resolvers := [2]JSValue{} // [resolve, reject]
 	promise := C.JS_NewPromiseCapability(cx, unsafe.SliceData(resolvers[:]))
-	if isException(promise) {
-		return promise
+	if promise.isException() {
+		return exception()
 	}
 	jobs++
 	go func() {
 		resp, err := http.Get(url)
-		resp.Body.Close()
 		ch <- func() {
 			defer freeValues(cx, resolvers[:])
 			f := resolvers[0]
 			arg := undefined()
-			if err != nil {
+			if err == nil {
+				responseids++
+				id := responseids
+				responses[id] = resp
+				arg = C.JS_NewInt64(cx, C.int64_t(id))
+			} else {
 				f = resolvers[1]
-				arg = makeTypeError(cx, err.Error())
-				defer C.JS_FreeValue(cx, arg)
+				arg = fromString(cx, err.Error())
 			}
+			defer C.JS_FreeValue(cx, arg)
 			result := C.JS_Call(cx, f, undefined(), 1, &arg)
 			defer C.JS_FreeValue(cx, result)
 		}
 	}()
 	return promise
+}
+
+//export read
+func read(cx *JSContext, thisObj JSValue, argc C.int, argv *JSValue) JSValue {
+	args := unsafe.Slice(argv, int(argc))
+	id := 0
+	if len(args) > 0 {
+		var ok bool
+		if id, ok = toInt(cx, args[0]); !ok {
+			return exception()
+		}
+	}
+	resp, ok := responses[id]
+	if !ok {
+		return throwTypeError(cx, "bad resource id")
+	}
+	resolvers := [2]JSValue{} // [resolve, reject]
+	promise := C.JS_NewPromiseCapability(cx, unsafe.SliceData(resolvers[:]))
+	if promise.isException() {
+		return exception()
+	}
+	jobs++
+	go func() {
+		b := make([]byte, 1024)
+		n, err := resp.Body.Read(b)
+		ch <- func() {
+			defer freeValues(cx, resolvers[:])
+			f := resolvers[0]
+			arg := undefined()
+			if err == nil || err == io.EOF {
+				arg = fromString(cx, string(b[:n])) // TODO handle multi-byte sequences
+			} else {
+				f = resolvers[1]
+				arg = fromString(cx, err.Error())
+			}
+			defer C.JS_FreeValue(cx, arg)
+			result := C.JS_Call(cx, f, undefined(), 1, &arg)
+			defer C.JS_FreeValue(cx, result)
+		}
+	}()
+	return promise
+}
+
+//export close
+func close(cx *JSContext, thisObj JSValue, argc C.int, argv *JSValue) JSValue {
+	args := unsafe.Slice(argv, int(argc))
+	id := 0
+	if len(args) > 0 {
+		var ok bool
+		if id, ok = toInt(cx, args[0]); !ok {
+			return exception()
+		}
+	}
+	if resp, ok := responses[id]; ok {
+		delete(responses, id)
+		resp.Body.Close()
+		return undefined()
+	}
+	return throwTypeError(cx, "bad resource id")
 }
