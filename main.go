@@ -10,7 +10,7 @@ package main
 //#define M(name) JSValue name(JSContext *cx, JSValue thisObj, int argc, JSValue *argv);
 //Q(EXCEPTION) Q(FALSE) Q(NULL) Q(TRUE) Q(UNDEFINED) Q(UNINITIALIZED)
 //M(atob) M(btoa) M(consoleLog) M(setTimeout) M(clearTimeout)
-//M(get) M(read) M(close)
+//M(request) M(read) M(close)
 import "C"
 
 import (
@@ -53,7 +53,7 @@ func main() {
 	global := C.JS_GetGlobalObject(cx)
 	defer C.JS_FreeValue(cx, global)
 
-	addMethod(cx, global, "get", 1, (*C.JSCFunction)(C.get))
+	addMethod(cx, global, "request", 1, (*C.JSCFunction)(C.request))
 	addMethod(cx, global, "read", 1, (*C.JSCFunction)(C.read))
 	addMethod(cx, global, "close", 0, (*C.JSCFunction)(C.close))
 
@@ -91,7 +91,8 @@ func main() {
 
 func executePendingJobs(rt *JSRuntime) {
 	var cx *JSContext
-	for 0 != C.JS_ExecutePendingJob(rt, &cx) {}
+	for 0 != C.JS_ExecutePendingJob(rt, &cx) {
+	}
 }
 
 //export hostPromiseRejectionTracker
@@ -246,7 +247,7 @@ func setTimeout(cx *JSContext, thisObj JSValue, argc C.int, argv *JSValue) JSVal
 				extra := args[2:]
 				argc := C.int(len(extra))
 				argv := unsafe.SliceData(extra)
-				result := C.JS_Call(cx, args[0],  global, argc, argv)
+				result := C.JS_Call(cx, args[0], global, argc, argv)
 				defer C.JS_FreeValue(cx, result)
 			}
 			//TODO handle code strings
@@ -287,12 +288,17 @@ func freeValues(cx *JSContext, vals []JSValue) {
 	}
 }
 
-//export get
-func get(cx *JSContext, thisObj JSValue, argc C.int, argv *JSValue) JSValue {
+//export request
+func request(cx *JSContext, thisObj JSValue, argc C.int, argv *JSValue) JSValue {
 	args := unsafe.Slice(argv, int(argc))
+	method := ""
 	url := ""
-	if len(args) > 0 {
-		url = toString(cx, args[0])
+	if len(args) > 1 {
+		method = toString(cx, args[0])
+		url = toString(cx, args[1])
+	}
+	if method == "" {
+		return throwTypeError(cx, "bad request method")
 	}
 	if url == "" {
 		return throwTypeError(cx, "bad URL")
@@ -304,7 +310,11 @@ func get(cx *JSContext, thisObj JSValue, argc C.int, argv *JSValue) JSValue {
 	}
 	jobs++
 	go func() {
-		resp, err := http.Get(url)
+		var resp *http.Response
+		req, err := http.NewRequest(method, url, nil)
+		if err == nil {
+			resp, err = http.DefaultClient.Do(req)
+		}
 		ch <- func() {
 			defer freeValues(cx, resolvers[:])
 			f := resolvers[0]
