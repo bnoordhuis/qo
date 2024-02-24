@@ -1,9 +1,12 @@
 package main
 
-//#cgo LDFLAGS: -L. -lquickjs -lm
+//#cgo LDFLAGS: -L. -lquickjs -Lqojs -lm
 //#include "3p/quickjs.h"
 //#include <stdlib.h>
 //#include <string.h>
+//#include <stdint.h>
+//extern uint32_t qojs_core_size;
+//extern uint8_t qojs_core[];
 //void hostPromiseRejectionTracker(JSContext *cx, JSValue promise, JSValue reason, JS_BOOL is_handled, void *opaque);
 //static JSValue throwTypeError(JSContext *cx, const char *message) { return JS_ThrowTypeError(cx, "%s", message); }
 //#define Q(name) static const JSValue JS##name(void) { return JS_##name; }
@@ -66,6 +69,8 @@ func main() {
 	addMethod(cx, console, "log", 0, (*C.JSCFunction)(C.consoleLog))
 	definePropertyValue(cx, global, "console", console, C.JS_PROP_CONFIGURABLE|C.JS_PROP_ENUMERABLE)
 
+	evalBytecode(cx, &C.qojs_core, C.qojs_core_size)
+
 	for _, filename := range flag.Args() {
 		b, err := os.ReadFile(filename)
 		if err != nil {
@@ -73,9 +78,7 @@ func main() {
 		}
 		v := eval(cx, filename, string(b), C.JS_EVAL_TYPE_GLOBAL|C.JS_EVAL_FLAG_STRICT)
 		if v.isException() {
-			v := C.JS_GetException(cx)
-			fmt.Println("exception:", toString(cx, v))
-			os.Exit(1)
+			fatalException(cx)
 		}
 		defer C.JS_FreeValue(cx, v)
 	}
@@ -87,6 +90,12 @@ func main() {
 		jobs--
 		executePendingJobs(rt)
 	}
+}
+
+func fatalException(cx *JSContext) {
+	v := C.JS_GetException(cx)
+	fmt.Println("Fatal exception:", toString(cx, v))
+	os.Exit(1)
 }
 
 func executePendingJobs(rt *JSRuntime) {
@@ -118,6 +127,22 @@ func eval(cx *JSContext, filename, source string, flags int) JSValue {
 	s := C.CString(source)
 	defer C.free(unsafe.Pointer(s))
 	return C.JS_Eval(cx, s, C.strlen(s), f, C.int(flags))
+}
+
+func evalBytecode(cx *JSContext, data *[0]C.uint8_t, size C.uint32_t) {
+	p := (*C.uint8_t)(unsafe.Pointer(data))
+	n := C.size_t(size)
+	obj := C.JS_ReadObject(cx, p, n, C.JS_READ_OBJ_BYTECODE)
+	if obj.isException() {
+		fatalException(cx)
+	}
+	defer C.JS_FreeValue(cx, obj)
+	val := C.JS_EvalFunction(cx, obj)
+	if val.isException() {
+		fatalException(cx)
+	}
+	defer C.JS_FreeValue(cx, val)
+
 }
 
 func toInt(cx *JSContext, v JSValue) (int, bool) {

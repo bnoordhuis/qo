@@ -3,7 +3,7 @@
 go()
 
 async function go() {
-	const r = await request("GET", "https://github.com/quickjs-ng/quickjs")
+	const r = await get("https://github.com/quickjs-ng/quickjs")
 	for (;;) {
 		const b = await read(r)
 		if (!b)
